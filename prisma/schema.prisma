@@ -1,0 +1,634 @@
+// =============================================================================
+// Quizly — database schema
+//
+// Prisma ORM 6 (stable). NOTE: Prisma 7 is available but `@auth/prisma-adapter`
+// does not yet declare support for `@prisma/client >= 7` in its peer range, and
+// Prisma 7 mandates ESM output + prisma.config.ts + a mandatory driver adapter.
+// This project therefore targets Prisma 6 for a zero-warning install.
+// See README "Upgrading to Prisma 7" for the migration path.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // Runtime: Supavisor transaction pooler (port 6543)
+  url      = env("DATABASE_URL")
+  // Migrations: direct/session connection (port 5432) — Migrate needs advisory locks,
+  // which a transaction pooler cannot provide.
+  directUrl = env("DIRECT_URL")
+}
+
+// -----------------------------------------------------------------------------
+// Enums
+// -----------------------------------------------------------------------------
+
+enum Role {
+  USER
+  MODERATOR
+  ADMIN
+}
+
+enum QuestionType {
+  MULTIPLE_CHOICE
+  MULTI_SELECT
+  TRUE_FALSE
+  SHORT_ANSWER
+}
+
+enum Difficulty {
+  EASY
+  MEDIUM
+  HARD
+}
+
+enum QuizStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum QuizVisibility {
+  PUBLIC
+  UNLISTED
+  PRIVATE
+}
+
+enum AttemptStatus {
+  IN_PROGRESS
+  SUBMITTED
+  GRADED
+  EXPIRED
+  ABANDONED
+}
+
+enum SessionStatus {
+  LOBBY
+  QUESTION_ACTIVE
+  REVEAL
+  SCOREBOARD
+  FINISHED
+  CANCELLED
+}
+
+enum LeaderboardScope {
+  GLOBAL
+  CATEGORY
+  QUIZ
+}
+
+enum LeaderboardPeriod {
+  ALL_TIME
+  MONTHLY
+  WEEKLY
+}
+
+enum ReportStatus {
+  OPEN
+  REVIEWING
+  RESOLVED
+  DISMISSED
+}
+
+// -----------------------------------------------------------------------------
+// Identity
+//
+// `User`, `Account`, `Session` and `VerificationToken` are the exact shapes
+// required by `@auth/prisma-adapter` (Auth.js v5). Do not rename their fields
+// without also updating the adapter — the adapter calls them by name.
+// -----------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  // Nullable on purpose: some OAuth providers do not always return an email.
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+
+  // --- Quizly extensions ---
+  username     String?   @unique
+  role         Role      @default(USER)
+  bio          String?
+  xp           Int       @default(0)
+  isBanned     Boolean   @default(false)
+  banReason    String?
+  premiumUntil DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  accounts         Account[]
+  sessions         Session[]
+  quizzes          Quiz[]
+  attempts         Attempt[]
+  banks            QuestionBank[]
+  hostedSessions   LiveSession[]
+  participations   SessionParticipant[]
+  leaderboard      LeaderboardEntry[]
+  reportsFiled     ModerationReport[] @relation("ReportReporter")
+  reportsAgainst   ModerationReport[] @relation("ReportTarget")
+  auditLogs        AuditLog[]
+
+  @@index([role, isBanned])
+  @@index([xp(sort: Desc)])
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// -----------------------------------------------------------------------------
+// Taxonomy
+// -----------------------------------------------------------------------------
+
+model Category {
+  id          String     @id @default(cuid())
+  slug        String     @unique
+  name        String
+  description String?
+  icon        String?
+  position    Int        @default(0)
+
+  parentId String?
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children Category[] @relation("CategoryTree")
+
+  createdAt DateTime @default(now())
+
+  quizzes     Quiz[]
+  banks       QuestionBank[]
+  leaderboard LeaderboardEntry[]
+
+  @@index([parentId, position])
+}
+
+model Tag {
+  id         String   @id @default(cuid())
+  slug       String   @unique
+  name       String   @unique
+  usageCount Int      @default(0)
+  createdAt  DateTime @default(now())
+
+  quizzes QuizTag[]
+
+  @@index([usageCount(sort: Desc)])
+}
+
+model QuizTag {
+  quizId String
+  tagId  String
+
+  quiz Quiz @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  tag  Tag  @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([quizId, tagId])
+  @@index([tagId])
+}
+
+// -----------------------------------------------------------------------------
+// Quizzes & questions
+// -----------------------------------------------------------------------------
+
+model Quiz {
+  id          String         @id @default(cuid())
+  // Shareable public link: /quizzes/{slug}
+  slug        String         @unique
+  title       String
+  description String?
+  coverImageUrl      String?
+  coverImagePublicId String?
+
+  status     QuizStatus     @default(DRAFT)
+  visibility QuizVisibility @default(UNLISTED)
+
+  authorId String
+  author   User   @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  categoryId String?
+  category   Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  // --- Timing & behaviour ---
+  // null = untimed quiz
+  timeLimitSeconds           Int?
+  defaultQuestionTimeSeconds Int     @default(30)
+  shuffleQuestions           Boolean @default(true)
+  shuffleOptions             Boolean @default(true)
+  // null = unlimited
+  maxAttempts                Int?
+  passScorePercent           Int     @default(60)
+  allowAnonymous             Boolean @default(false)
+  embedEnabled               Boolean @default(true)
+  isPremium                  Boolean @default(false)
+
+  // --- Denormalised counters (kept in the same transaction as their source) ---
+  attemptCount Int      @default(0)
+  embedCount   Int      @default(0)
+  averageScore Float?
+  ratingSum    Int      @default(0)
+  ratingCount  Int      @default(0)
+
+  publishedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  questions   Question[]
+  attempts    Attempt[]
+  tags        QuizTag[]
+  sessions    LiveSession[]
+  leaderboard LeaderboardEntry[]
+
+  @@index([status, visibility, publishedAt(sort: Desc)])
+  @@index([categoryId, status])
+  @@index([authorId, status])
+  @@index([attemptCount(sort: Desc)])
+}
+
+/// A Question belongs to exactly ONE container: a Quiz (quizId) or a
+/// QuestionBank (bankId). Prisma cannot express that XOR in the schema, so it is
+/// enforced by the `question_container_xor` CHECK constraint in the initial
+/// migration (see prisma/migrations/0001_init/migration.sql).
+model Question {
+  id String @id @default(cuid())
+
+  quizId String?
+  quiz   Quiz?   @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  bankId String?
+  bank   QuestionBank? @relation(fields: [bankId], references: [id], onDelete: Cascade)
+
+  type        QuestionType
+  prompt      String
+  explanation String?
+  imageUrl    String?
+  difficulty  Difficulty   @default(MEDIUM)
+  points      Int          @default(1)
+  // Per-question override; falls back to Quiz.defaultQuestionTimeSeconds
+  timeLimitSeconds Int?
+  position         Int     @default(0)
+
+  // SHORT_ANSWER grading
+  caseSensitive   Boolean  @default(false)
+  acceptedAnswers String[] @default([])
+
+  tags String[] @default([])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  options        Option[]
+  answers        Answer[]
+  sessionAnswers SessionAnswer[]
+
+  @@index([quizId, position])
+  @@index([bankId, position])
+  @@index([difficulty])
+  @@index([type])
+}
+
+model Option {
+  id String @id @default(cuid())
+
+  questionId String
+  question   Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  label String
+  /// SECURITY: never include this field in any payload sent to a client before
+  /// the question has been revealed. Use the projections in src/lib/game/fetch.ts.
+  isCorrect Boolean @default(false)
+  position  Int     @default(0)
+  imageUrl  String?
+
+  @@index([questionId, position])
+}
+
+/// A reusable pool of questions that can be copied into quizzes.
+model QuestionBank {
+  id          String  @id @default(cuid())
+  title       String
+  description String?
+
+  ownerId String
+  owner   User   @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  categoryId String?
+  category   Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  isPublic  Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  questions Question[]
+
+  @@index([ownerId])
+  @@index([categoryId, isPublic])
+}
+
+// -----------------------------------------------------------------------------
+// Attempts & answers
+// -----------------------------------------------------------------------------
+
+model Attempt {
+  id String @id @default(cuid())
+
+  quizId String
+  quiz   Quiz   @relation(fields: [quizId], references: [id], onDelete: Cascade)
+
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  /// Stable identity for a participant (HMAC of userId, or of ip+user-agent for
+  /// anonymous players). NOT globally unique: a player may retry a quiz many
+  /// times. The partial unique index `Attempt_one_in_progress_per_participant`
+  /// (status = 'IN_PROGRESS') prevents double-start races between tabs while
+  /// still allowing repeat attempts after a previous one completes.
+  participantKey String
+
+  /// Idempotency key for attempts created by the SYSTEM rather than by a player
+  /// (currently: mirroring a live session's results). Nullable + unique, so
+  /// many NULLs are allowed and a retried job cannot create duplicates.
+  sourceKey String? @unique
+
+  /// SOLO | LIVE | PRACTICE
+  mode String @default("SOLO")
+
+  status AttemptStatus @default(IN_PROGRESS)
+
+  startedAt   DateTime  @default(now())
+  submittedAt DateTime?
+  /// Drives SERVER-SIDE auto-submit. The client clock is never trusted.
+  expiresAt   DateTime?
+  durationMs  Int?
+
+  score          Int   @default(0)
+  maxScore       Int   @default(0)
+  correctCount   Int   @default(0)
+  incorrectCount Int   @default(0)
+  skippedCount   Int   @default(0)
+  /// 0..1, written on finalize
+  accuracy       Float?
+
+  /// Never store a raw IP address.
+  ipHash    String?
+  userAgent String?
+
+  createdAt DateTime @default(now())
+
+  answers Answer[]
+
+  @@index([quizId, score(sort: Desc), durationMs])
+  @@index([userId, startedAt(sort: Desc)])
+  @@index([status, expiresAt])
+  @@index([quizId, status])
+  @@index([quizId, participantKey, status])
+}
+
+model Answer {
+  id String @id @default(cuid())
+
+  attemptId String
+  attempt   Attempt  @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+
+  questionId String
+  question   Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  /// Stored as a Postgres text[]. `unnest()` gives distractor analytics without a
+  /// join table, at one write per answer instead of 1+n.
+  selectedOptionIds String[] @default([])
+  /// SHORT_ANSWER raw input (sanitised + length-capped before storage).
+  textAnswer        String?
+
+  isCorrect     Boolean?
+  awardedPoints Int      @default(0)
+  /// Powers the "time per question" chart.
+  timeSpentMs   Int      @default(0)
+  answeredAt    DateTime @default(now())
+
+  /// Makes answer submission idempotent — a retried request cannot double-count.
+  @@unique([attemptId, questionId])
+  @@index([questionId, isCorrect])
+}
+
+// -----------------------------------------------------------------------------
+// Leaderboards
+//
+// GLOBAL and CATEGORY boards are materialised here and refreshed by a job.
+// Per-QUIZ boards are computed on read from `Attempt` (the composite index above
+// makes a top-50 query an index-only scan), so we do not pay write amplification
+// for a board that is cheap to derive.
+//
+// IMPORTANT: categoryId/quizId are non-null Strings defaulting to "" — Postgres
+// treats NULLs as distinct inside UNIQUE indexes, which would silently break
+// every upsert for GLOBAL rows.
+// -----------------------------------------------------------------------------
+
+model LeaderboardEntry {
+  id String @id @default(cuid())
+
+  scope       LeaderboardScope
+  period      LeaderboardPeriod @default(ALL_TIME)
+  periodStart DateTime
+
+  categoryId String @default("")
+  quizId     String @default("")
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  score        Int      @default(0)
+  attemptCount Int      @default(0)
+  accuracy     Float    @default(0)
+  bestTimeMs   Int?
+  rank         Int?
+  updatedAt    DateTime @updatedAt
+
+  category Category? @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  quiz     Quiz?     @relation(fields: [quizId], references: [id], onDelete: Cascade)
+
+  @@unique([scope, period, periodStart, categoryId, quizId, userId])
+  @@index([scope, period, categoryId, score(sort: Desc)])
+  @@index([scope, period, quizId, score(sort: Desc)])
+  @@index([userId, scope, period])
+}
+
+// -----------------------------------------------------------------------------
+// Live multiplayer
+// -----------------------------------------------------------------------------
+
+model LiveSession {
+  id String @id @default(cuid())
+
+  /// 6-character join code shown to players. Ambiguous characters are excluded by
+  /// the generator (see src/lib/game/codes.ts).
+  code String @unique
+
+  hostId String
+  host   User   @relation(fields: [hostId], references: [id], onDelete: Cascade)
+
+  quizId String
+  quiz   Quiz   @relation(fields: [quizId], references: [id], onDelete: Cascade)
+
+  status SessionStatus @default(LOBBY)
+
+  /// -1 while in LOBBY
+  currentQuestionIndex Int       @default(-1)
+  questionStartedAt    DateTime?
+  questionEndsAt       DateTime?
+  /// Capped to stay comfortably inside Supabase Realtime connection limits.
+  maxParticipants      Int       @default(100)
+
+  /// { speedBonus: boolean, streakBonus: boolean, showLiveLeaderboard: boolean }
+  settings Json?
+
+  startedAt DateTime?
+  endedAt   DateTime?
+  createdAt DateTime  @default(now())
+
+  participants SessionParticipant[]
+
+  @@index([status, createdAt])
+  @@index([hostId])
+}
+
+model SessionParticipant {
+  id String @id @default(cuid())
+
+  sessionId String
+  session   LiveSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  /// Device token for players who never signed in.
+  guestId String?
+
+  displayName  String
+  score        Int      @default(0)
+  streak       Int      @default(0)
+  correctCount Int      @default(0)
+  joinedAt     DateTime @default(now())
+  lastSeenAt   DateTime @default(now())
+
+  answers SessionAnswer[]
+
+  @@unique([sessionId, userId])
+  @@unique([sessionId, guestId])
+  @@index([sessionId, score(sort: Desc)])
+}
+
+model SessionAnswer {
+  id String @id @default(cuid())
+
+  sessionId     String
+  participantId String
+  participant   SessionParticipant @relation(fields: [participantId], references: [id], onDelete: Cascade)
+
+  questionId String
+  question   Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  selectedOptionIds String[] @default([])
+  textAnswer        String?
+  isCorrect         Boolean
+  awardedPoints     Int      @default(0)
+  responseMs        Int      @default(0)
+  answeredAt        DateTime @default(now())
+
+  @@unique([participantId, questionId])
+  @@index([sessionId, questionId])
+}
+
+// -----------------------------------------------------------------------------
+// Moderation & operations
+// -----------------------------------------------------------------------------
+
+model ModerationReport {
+  id String @id @default(cuid())
+
+  reporterId String?
+  reporter   User?   @relation("ReportReporter", fields: [reporterId], references: [id], onDelete: SetNull)
+
+  targetUserId String?
+  targetUser   User?   @relation("ReportTarget", fields: [targetUserId], references: [id], onDelete: SetNull)
+
+  quizId String?
+
+  reason  String
+  details String?
+  status  ReportStatus @default(OPEN)
+
+  resolvedById String?
+  resolvedAt   DateTime?
+  resolution   String?
+
+  createdAt DateTime @default(now())
+
+  @@index([status, createdAt])
+  @@index([targetUserId])
+}
+
+model AuditLog {
+  id String @id @default(cuid())
+
+  actorId String?
+  actor   User?   @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  action   String
+  target   String?
+  metadata Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([actorId, createdAt(sort: Desc)])
+  @@index([action, createdAt(sort: Desc)])
+}
+
+/// Idempotency ledger for inbound webhooks. Providers retry; without this, a
+/// retried `checkout.session.completed` grants premium twice.
+model WebhookEvent {
+  id          String   @id @default(cuid())
+  provider    String
+  eventId     String
+  type        String
+  processedAt DateTime @default(now())
+
+  @@unique([provider, eventId])
+}
+
+
+
+

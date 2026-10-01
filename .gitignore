@@ -1,0 +1,51 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+
+# next.js
+/.next/
+/out/
+next-env.d.ts
+
+# production
+/build
+
+# testing
+/coverage
+
+# misc
+.DS_Store
+*.pem
+Thumbs.db
+
+# env files
+.env
+.env*.local
+!.env.example
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+
+# prisma
+prisma/*.db
+prisma/*.db-journal
+
+# sentry / build artifacts
+.sentryclirc
+
+# local dev artifacts (never commit)
+*.log
+*probe.txt
+*tail.txt
+alive.txt
+attempt.json
+home.html
+lb.json
+quiz.json
+
+# embedded-postgres data dir (only if someone overrides QUIZLY_PGDATA into repo)
+/data/db/
