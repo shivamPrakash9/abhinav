@@ -43,6 +43,7 @@ const PROTECTED_PREFIXES = [
   '/user',
   '/settings',
   '/admin',
+  '/attempts',
 ] as const;
 
 function isProtectedPath(pathname: string): boolean {

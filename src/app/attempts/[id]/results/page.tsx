@@ -1,4 +1,4 @@
-import { notFound } from 'next/navigation';
+import { notFound, redirect } from 'next/navigation';
 import { requireUser } from '@/lib/auth';
 import { prisma } from '@/lib/db';
 
@@ -6,7 +6,12 @@ export const dynamic = 'force-dynamic';
 
 export default async function ResultsPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const user = await requireUser();
+  let user: Awaited<ReturnType<typeof requireUser>>;
+  try {
+    user = await requireUser();
+  } catch {
+    redirect(`/sign-in?callbackUrl=/attempts/${id}/results`);
+  }
   const attempt = await prisma.attempt.findFirst({
     where: { id, userId: user.id },
     select: {
